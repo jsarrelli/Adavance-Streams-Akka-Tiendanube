@@ -3,12 +3,10 @@ package followers
 import akka.NotUsed
 import akka.event.Logging
 import akka.stream.scaladsl.{BroadcastHub, Flow, Framing, Keep, MergeHub, Sink, Source}
-import akka.stream.{ActorAttributes, Materializer, scaladsl}
+import akka.stream.{ActorAttributes, Materializer}
 import akka.util.ByteString
-import followers.model.Event.Unfollow
 import followers.model.{Event, Followers, Identity}
 
-import scala.collection.immutable.SortedSet
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
@@ -95,7 +93,7 @@ object Server extends ServerModuleInterface {
             Nil
         }
 
-        bufferedEvents() ::: currentEvent
+        bufferedEvents() ::: currentEvent ::: bufferedEvents()
       }
     }
 
@@ -121,7 +119,7 @@ object Server extends ServerModuleInterface {
           followers.put(fromUserId, unfollowed)
           (event, followers.toMap) :: Nil
 
-        case _ => Nil
+        case event => (event, followers.toMap) :: Nil
       }
     }
   }
@@ -141,7 +139,7 @@ object Server extends ServerModuleInterface {
       case _: Event.Broadcast => true
       case Event.Follow(_, _, toUserId) => toUserId == userId
       case Event.PrivateMsg(_, _, toUserId) => userId == toUserId
-      case Event.StatusUpdate(_, _)  => followers.contains(userId)
+      case Event.StatusUpdate(_, fromUserId) => followers.get(userId).exists(_.contains(fromUserId))
     }
   }
 
@@ -178,7 +176,6 @@ class Server()(implicit executionContext: ExecutionContext, materializer: Materi
       */
     val incomingDataFlow: Flow[ByteString, (Event, Followers), NotUsed] =
       eventParserFlow
-        .via(reintroduceOrdering)
         .via(followersFlow)
 
     // Wires the MergeHub and the BroadcastHub together and runs the graph
@@ -203,7 +200,7 @@ class Server()(implicit executionContext: ExecutionContext, materializer: Materi
     * `Flow.fromSinkAndSourceCoupled` to find how to achieve that.
     */
   val eventsFlow: Flow[ByteString, Nothing, NotUsed] =
-    Flow.fromSinkAndSourceCoupled[ByteString,Nothing](inboundSink,Source.maybe[Nothing])
+    Flow.fromSinkAndSourceCoupled[ByteString, Nothing](inboundSink, Source.maybe)
 
   /**
     * @return The source of events for the given user
@@ -217,34 +214,33 @@ class Server()(implicit executionContext: ExecutionContext, materializer: Materi
     *               Private Message: Only the To User Id should be notified
     *               Status Update:   All current followers of the From User ID should be notified
     */
-  def outgoingFlow(userId: Int): Source[ByteString, NotUsed] = broadcastOut.filter(isNotified(userId)).map{
+  def outgoingFlow(userId: Int): Source[ByteString, NotUsed] = broadcastOut.filter(isNotified(userId)).map {
     case (event, _) => event.render
   }
 
   /**
-   * The "final form" of the client flow.
-   *
-   * Clients will connect to this server and send their id as an Identity message (e.g. "21323\n").
-   *
-   * The server should establish a link from the event source towards the clients, in such way that they
-   * receive only the events that they are interested about.
-   *
-   * The incoming side of this flow needs to extract the client id to then properly construct the outgoing Source,
-   * as it will need this identifier to notify the server which data it is interested about.
-   *
-   * Hints:
-   *   - since the clientId will be emitted as a materialized value of `identityParserSink`,
-   *     you may need to use mapMaterializedValue to side effect it into a shared Promise/Future that the Source
-   *     side can utilise to construct such Source "from that client id future".
-   *   - Remember to use `via()` to connect a `Flow`, and `to()` to connect a `Sink`.
-   */
+    * The "final form" of the client flow.
+    *
+    * Clients will connect to this server and send their id as an Identity message (e.g. "21323\n").
+    *
+    * The server should establish a link from the event source towards the clients, in such way that they
+    * receive only the events that they are interested about.
+    *
+    * The incoming side of this flow needs to extract the client id to then properly construct the outgoing Source,
+    * as it will need this identifier to notify the server which data it is interested about.
+    *
+    * Hints:
+    *   - since the clientId will be emitted as a materialized value of `identityParserSink`,
+    *     you may need to use mapMaterializedValue to side effect it into a shared Promise/Future that the Source
+    *     side can utilise to construct such Source "from that client id future".
+    *   - Remember to use `via()` to connect a `Flow`, and `to()` to connect a `Sink`.
+    */
   def clientFlow(): Flow[ByteString, ByteString, NotUsed] = {
     val clientIdPromise = Promise[Identity]()
-//    clientIdPromise.future.map(id => actorSystem.log.info("Connected follower: {}", id.userId))
+    //    clientIdPromise.future.map(id => actorSystem.log.info("Connected follower: {}", id.userId))
 
     // A sink that parses the client identity and completes `clientIdPromise` with it
-    val incoming: Sink[ByteString, NotUsed] =
-      ???
+    val incoming: Sink[ByteString, Future[clientIdPromise.type]] = identityParserSink.mapMaterializedValue(_.map(clientIdPromise.success))
 
     val outgoing = Source.futureSource(clientIdPromise.future.map { identity =>
       outgoingFlow(identity.userId)
