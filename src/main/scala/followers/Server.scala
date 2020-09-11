@@ -7,6 +7,7 @@ import akka.stream.{ActorAttributes, Materializer}
 import akka.util.ByteString
 import followers.model.{Event, Followers, Identity}
 
+import scala.annotation.tailrec
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
@@ -77,10 +78,11 @@ object Server extends ServerModuleInterface {
       val buffer = mutable.Map.empty[Int, Event]
 
       event => {
-        def bufferedEvents(aux: List[Event] = List.empty[Event]) = buffer.get(expectedSequence) match {
+        @tailrec
+        def bufferedEvents(aux: List[Event] = List.empty[Event]): List[Event] = buffer.get(expectedSequence) match {
           case Some(bufferedEvent) =>
             expectedSequence += 1
-            aux :+ bufferedEvent
+            bufferedEvents(aux :+ bufferedEvent)
           case None => aux
         }
 
@@ -93,7 +95,7 @@ object Server extends ServerModuleInterface {
             Nil
         }
 
-        bufferedEvents() ::: currentEvent ::: bufferedEvents()
+        currentEvent ::: bufferedEvents()
       }
     }
 
@@ -240,7 +242,11 @@ class Server()(implicit executionContext: ExecutionContext, materializer: Materi
     //    clientIdPromise.future.map(id => actorSystem.log.info("Connected follower: {}", id.userId))
 
     // A sink that parses the client identity and completes `clientIdPromise` with it
-    val incoming: Sink[ByteString, Future[clientIdPromise.type]] = identityParserSink.mapMaterializedValue(_.map(clientIdPromise.success))
+    val incoming: Sink[ByteString, NotUsed] = identityParserSink.preMaterialize() match {
+      case (materializeValue,sink) =>
+        materializeValue.foreach(clientIdPromise.success)
+        sink
+    }
 
     val outgoing = Source.futureSource(clientIdPromise.future.map { identity =>
       outgoingFlow(identity.userId)
